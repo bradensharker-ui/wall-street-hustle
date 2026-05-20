@@ -118,10 +118,53 @@ export const EVENTS = [
 ];
 
 // ===== RNG =====
-// Currently uses Math.random(). Milestone 2 will replace with a seeded PRNG
-// so a class of students can play identical 10-year paths from one seed.
-// Functions accept an optional `rng` so they can be tested with a custom RNG.
+// All gameplay randomness flows through a seedable PRNG (mulberry32). One
+// seed yields one 10-year market path. This is what lets an entire classroom
+// play the *identical* game from one teacher-generated code.
+//
+// Cosmetic randomness (audio noise, eye blinks, screen-shake jitter) stays
+// on Math.random — it doesn't influence state and shouldn't burn seed bits.
 function defaultRng() { return Math.random(); }
+
+// FNV-1a 32-bit hash — turns a human-readable seed code into a numeric seed.
+export function hashSeed(input) {
+  const str = String(input);
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+// mulberry32 — small, fast, well-known PRNG. Returns a stateful function.
+export function makeRng(seed) {
+  let a = (typeof seed === 'string' ? hashSeed(seed) : (seed >>> 0));
+  return function rng() {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Seed-code alphabet: no 0/O, 1/I/L — fewer "what character is that?" issues
+// when a teacher reads a code aloud or writes it on the board.
+const SEED_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+
+export function generateSeedCode(rng = Math.random) {
+  let body = '';
+  for (let i = 0; i < 6; i++) body += SEED_ALPHABET[Math.floor(rng() * SEED_ALPHABET.length)];
+  return `WSH-${body}`;
+}
+
+export function normalizeSeedCode(input) {
+  return String(input || '').toUpperCase().replace(/[^A-Z0-9-]/g, '').trim();
+}
+
+export function pickRandom(arr, rng = defaultRng) {
+  return arr[Math.floor(rng() * arr.length)];
+}
 
 // ===== MATH =====
 // Box–Muller transform: two uniforms → one standard normal sample.

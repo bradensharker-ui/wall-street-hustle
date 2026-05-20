@@ -16,6 +16,7 @@ import {
   ASSETS, HORIZON_YEARS, EVENT_RATE_PER_YEAR, EVENT_SHOCK_SCALE,
   eventProbPerTurn, gaussian, stepPrice, predictedMedian, monteCarloSim,
   getLifestyle, LIFESTYLE_TIERS,
+  makeRng, hashSeed, generateSeedCode, normalizeSeedCode,
 } from './sim.js';
 
 // Small, well-known seedable PRNG. Same seed → identical sequence everywhere.
@@ -162,6 +163,71 @@ describe('Monte Carlo ↔ analytical trend reconciliation', () => {
       expect(drift).toBeLessThan(TOLERANCE);
     });
   }
+});
+
+// -----------------------------------------------------------------------------
+// SEEDED RNG — determinism contract for the classroom feature
+// -----------------------------------------------------------------------------
+
+describe('makeRng / hashSeed (classroom determinism)', () => {
+  test('the same seed (string or number) produces an identical sequence', () => {
+    const r1 = makeRng('WSH-7K3M9P');
+    const r2 = makeRng('WSH-7K3M9P');
+    for (let i = 0; i < 50; i++) {
+      expect(r1()).toBe(r2());
+    }
+  });
+
+  test('different seeds produce different sequences', () => {
+    const r1 = makeRng('WSH-AAAAAA');
+    const r2 = makeRng('WSH-BBBBBB');
+    let differences = 0;
+    for (let i = 0; i < 20; i++) {
+      if (r1() !== r2()) differences++;
+    }
+    expect(differences).toBeGreaterThan(15); // overwhelmingly different
+  });
+
+  test('two students on the same seed get byte-identical 100-step price paths', () => {
+    const spx = asset('SPX');
+    const r1 = makeRng('WSH-CLASS01');
+    const r2 = makeRng('WSH-CLASS01');
+    const path1 = [], path2 = [];
+    let p1 = 100, p2 = 100;
+    for (let i = 0; i < 100; i++) {
+      p1 = stepPrice(p1, spx.mu, spx.sigma, 0, 0.1, r1);
+      p2 = stepPrice(p2, spx.mu, spx.sigma, 0, 0.1, r2);
+      path1.push(p1); path2.push(p2);
+    }
+    expect(path1).toEqual(path2);
+  });
+
+  test('rng() outputs are in [0, 1)', () => {
+    const r = makeRng(0xDEADBEEF);
+    for (let i = 0; i < 1000; i++) {
+      const v = r();
+      expect(v).toBeGreaterThanOrEqual(0);
+      expect(v).toBeLessThan(1);
+    }
+  });
+});
+
+describe('Seed-code formatting', () => {
+  test('generateSeedCode produces a WSH-prefixed 10-char code from the safe alphabet', () => {
+    const code = generateSeedCode(makeRng(1234));
+    expect(code).toMatch(/^WSH-[2-9A-HJ-NP-Z]{6}$/);
+    expect(code).not.toContain('0');
+    expect(code).not.toContain('O');
+    expect(code).not.toContain('1');
+    expect(code).not.toContain('I');
+    expect(code).not.toContain('L');
+  });
+
+  test('normalizeSeedCode strips junk and uppercases', () => {
+    expect(normalizeSeedCode(' wsh-7k3m9p ')).toBe('WSH-7K3M9P');
+    expect(normalizeSeedCode('wsh.7k!3m9p?')).toBe('WSH7K3M9P');
+    expect(normalizeSeedCode(null)).toBe('');
+  });
 });
 
 // -----------------------------------------------------------------------------

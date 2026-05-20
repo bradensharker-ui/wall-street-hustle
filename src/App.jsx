@@ -4,6 +4,7 @@ import {
   LIFESTYLE_TIERS, getLifestyle, HORIZON_YEARS, GAME_LENGTHS, AUTO_SPEEDS,
   EVENT_RATE_PER_YEAR, EVENT_SHOCK_SCALE, eventProbPerTurn,
   EVENTS, gaussian, stepPrice, predictedMedian, monteCarloSim, createSchedule,
+  makeRng, generateSeedCode, normalizeSeedCode, pickRandom,
 } from './sim.js';
 
 // ===== ASSETS, START, AVATAR_*, LIFESTYLE_TIERS, getLifestyle, GAME_LENGTHS,
@@ -161,7 +162,37 @@ const LEO_FILLER = [
 // Vibe score from holdings — "cool" assets boost vibe, "dry" assets tank it.
 const LEO_VIBE_BY_ASSET = { BOND: -2, TBILL: -2, GOLD: -1, SPX: 0, TECH: 2, BTC: 3, MEME: 3 };
 
-function pickRandom(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+// pickRandom now imported from sim.js (accepts an rng argument for determinism).
+
+// Build a shareable URL with the class seed baked in. Students click the link
+// and the game opens with the seed pre-filled — no transcription required.
+function buildShareUrl(seed) {
+  if (typeof window === 'undefined') return `?seed=${seed}`;
+  const { origin, pathname } = window.location;
+  return `${origin}${pathname}?seed=${seed}`;
+}
+
+// Best-effort clipboard write. Modern Clipboard API on HTTPS/localhost; a
+// hidden <textarea> + execCommand fallback for older browsers / odd contexts.
+async function copyToClipboard(text) {
+  try {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (e) { /* fall through */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch (e) { return false; }
+}
 
 // ===== AUDIO =====
 let audioCtx = null;
@@ -531,6 +562,7 @@ function TeacherDashboard({ onClose }) {
   const [studentName, setStudentName] = useState('');
   const [studentCode, setStudentCode] = useState('');
   const [tab, setTab] = useState('class');
+  const [selectedSeed, setSelectedSeed] = useState(''); // '' = all
 
   useEffect(() => {
     try { setResults(JSON.parse(localStorage.getItem('wsh_class_results') || '[]')); }
@@ -541,10 +573,18 @@ function TeacherDashboard({ onClose }) {
     if (!studentCode.trim() || !studentName.trim()) return;
     try {
       const parts = studentCode.split('|');
-      if (parts.length < 4) { alert('Invalid code'); return; }
-      const [handle, finalScore, indexScore, lessons] = parts;
+      // New format: seed|handle|finalScore|indexScore|lessons. Old codes from
+      // pre-seed builds had 4 parts (handle|...); accept both for backward compat.
+      let seed = '', handle, finalScore, indexScore, lessons;
+      if (parts.length >= 5) {
+        [seed, handle, finalScore, indexScore, lessons] = parts;
+      } else if (parts.length === 4) {
+        [handle, finalScore, indexScore, lessons] = parts;
+      } else {
+        alert('Invalid code'); return;
+      }
       const newR = {
-        name: studentName.trim(), handle,
+        name: studentName.trim(), handle, seed,
         finalScore: parseFloat(finalScore), indexScore: parseFloat(indexScore),
         beat: parseFloat(finalScore) > parseFloat(indexScore),
         lessons: lessons.split(','), timestamp: Date.now(),
@@ -558,9 +598,17 @@ function TeacherDashboard({ onClose }) {
   function clearAll() {
     if (window.confirm('Clear all?')) { localStorage.removeItem('wsh_class_results'); setResults([]); }
   }
-  const beatIndex = results.filter(r => r.beat).length;
+  // Filter view by seed if one is selected. Useful when several classes have
+  // played different sessions on the same device.
+  const filtered = selectedSeed
+    ? results.filter(r => (r.seed || '') === selectedSeed)
+    : results;
+  const beatIndex = filtered.filter(r => r.beat).length;
   const lessonTally = {};
-  results.forEach(r => (r.lessons || []).forEach(l => { if (l) lessonTally[l] = (lessonTally[l] || 0) + 1; }));
+  filtered.forEach(r => (r.lessons || []).forEach(l => { if (l) lessonTally[l] = (lessonTally[l] || 0) + 1; }));
+  // Seed tally across ALL results, so the teacher can see what sessions exist.
+  const seedTally = {};
+  results.forEach(r => { const k = r.seed || '—'; seedTally[k] = (seedTally[k] || 0) + 1; });
 
   return (
     <div style={styles.container}>
@@ -582,12 +630,29 @@ function TeacherDashboard({ onClose }) {
           <button onClick={submitResult} style={styles.submitBtn}>Add</button>
         </div>
         <div style={styles.dashCard}>
-          <div style={styles.cardTitle}>📊 STATS ({results.length})</div>
-          <div style={styles.statLine}>Beat index: <b>{beatIndex}/{results.length}</b> ({results.length ? Math.round(beatIndex/results.length*100) : 0}%)</div>
+          <div style={styles.cardTitle}>🎓 SESSIONS BY SEED</div>
+          {Object.keys(seedTally).length === 0 ? <div style={styles.muted}>No results yet.</div> :
+            <>
+              <div style={styles.tradeRow}>
+                <button onClick={() => setSelectedSeed('')} style={{...styles.maxBtn, borderColor: selectedSeed === '' ? '#39ff14' : '#555', color: selectedSeed === '' ? '#39ff14' : '#aaa'}}>All ({results.length})</button>
+              </div>
+              {Object.entries(seedTally).sort((a,b) => b[1]-a[1]).map(([s, n]) => (
+                <div key={s} style={styles.tradeRow}>
+                  <button onClick={() => setSelectedSeed(s === '—' ? '' : s)}
+                    style={{...styles.maxBtn, textAlign: 'left', borderColor: selectedSeed === s ? '#39ff14' : '#555', color: selectedSeed === s ? '#39ff14' : '#ddd'}}>
+                    {s === '—' ? '(no seed — solo runs)' : s} · <b>{n}</b>
+                  </button>
+                </div>
+              ))}
+            </>}
+        </div>
+        <div style={styles.dashCard}>
+          <div style={styles.cardTitle}>📊 STATS ({filtered.length}{selectedSeed ? ` · ${selectedSeed}` : ''})</div>
+          <div style={styles.statLine}>Beat index: <b>{beatIndex}/{filtered.length}</b> ({filtered.length ? Math.round(beatIndex/filtered.length*100) : 0}%)</div>
           <div style={styles.muted}>In real markets, ~80% of active traders lose to passive indexing.</div>
         </div>
         <div style={styles.dashCard}>
-          <div style={styles.cardTitle}>🧭 BEHAVIORS THIS CLASS FELL INTO</div>
+          <div style={styles.cardTitle}>🧭 BEHAVIORS THIS COHORT FELL INTO</div>
           {Object.keys(lessonTally).length === 0 ? <div style={styles.muted}>No results yet</div> :
             Object.entries(lessonTally).sort((a,b) => b[1]-a[1]).map(([l, n]) => (
               <div key={l} style={styles.statLine}>{LESSON_LABEL[l] || l}: <b>{n}</b></div>
@@ -595,8 +660,8 @@ function TeacherDashboard({ onClose }) {
         </div>
         <div style={styles.dashCard}>
           <div style={styles.cardTitle}>👥 RESULTS</div>
-          {results.length === 0 ? <div style={styles.muted}>No results yet</div> :
-            results.sort((a,b)=>b.finalScore-a.finalScore).map((r, i) => (
+          {filtered.length === 0 ? <div style={styles.muted}>No results in this view</div> :
+            [...filtered].sort((a,b)=>b.finalScore-a.finalScore).map((r, i) => (
               <div key={i} style={styles.resultRow}>
                 <div><b>{r.name}</b> <span style={{ color: '#666' }}>@{r.handle}</span></div>
                 <div style={{ color: r.beat ? '#39ff14' : '#ff3b3b', fontSize: '11px' }}>${r.finalScore.toFixed(0)} vs ${r.indexScore.toFixed(0)} ({r.beat ? '✓' : '✗'})</div>
@@ -668,6 +733,7 @@ function Leaderboard({ onClose }) {
               <div>
                 <b>{i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `#${i + 1}`} {r.name}</b>
                 {' '}<span style={{ color: '#666' }}>@{r.handle}</span>
+                {r.seed && <div style={{ fontSize: '9px', color: '#39a0ff', marginTop: '2px' }}>🎓 {r.seed}</div>}
               </div>
               <div style={{ color: r.beat ? '#39ff14' : '#ff3b3b', fontSize: '11px' }}>
                 ${r.finalScore.toFixed(0)} vs index ${r.indexScore.toFixed(0)} ({r.beat ? 'beat ✓' : 'lost ✗'})
@@ -689,6 +755,8 @@ function StartScreen({ onStart, avatar, setAvatar, onTeacher, onLeaderboard, set
   const av = avatar || defaultAvatar();
   const set = (patch) => setAvatar({ ...av, ...patch });
   const cleanHandle = (s) => s.toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 16);
+  const [toast, setToast] = useState('');
+  function flash(msg) { setToast(msg); setTimeout(() => setToast(''), 2000); }
   useEffect(() => { startMusic('title'); return () => stopMusic(); }, []);
   return (
     <div style={styles.container}>
@@ -753,19 +821,52 @@ function StartScreen({ onStart, avatar, setAvatar, onTeacher, onLeaderboard, set
         <div style={styles.classStats}>You start with ${START.cash} cash and a ${START.loan} student loan @ {(START.loanAPR*100).toFixed(0)}%. Everyone's the same — the lessons come from your choices.</div>
       </div>
 
+      {/* Class seed — for synchronous classroom play. Teacher generates and
+          shares the code; students enter it and play the identical 10 years. */}
+      <div style={styles.classDetail}>
+        <div style={styles.classDetailName}>🎓 CLASSROOM (OPTIONAL)</div>
+        <div style={styles.muted}>Leave blank for a fresh random market. Enter a class seed to play the identical 10 years as the rest of your class.</div>
+        <div style={styles.tradeRow}>
+          <input value={settings.classSeed || ''}
+            onChange={e => setSettings({ ...settings, classSeed: normalizeSeedCode(e.target.value) })}
+            placeholder="WSH-XXXXXX"
+            style={{ ...styles.input, marginBottom: 0 }} />
+          <button onClick={() => { setSettings({ ...settings, classSeed: generateSeedCode() }); sfx.click(); }}
+            style={styles.maxBtn}>🎲 Generate (teacher)</button>
+        </div>
+        {settings.classSeed && <>
+          <div style={{ ...styles.classStats, color: '#39a0ff' }}>Active seed: <b>{settings.classSeed}</b> — every student who enters this gets identical events &amp; prices.</div>
+          <button onClick={async () => {
+              const ok = await copyToClipboard(buildShareUrl(settings.classSeed));
+              flash(ok ? '🔗 Class link copied — paste it for your students.' : '⚠️ Copy failed — select the URL bar manually.');
+              sfx.click();
+            }}
+            style={{ ...styles.maxBtn, width: '100%', marginTop: '8px', borderColor: '#39a0ff', color: '#39a0ff' }}>
+            🔗 Copy class link (paste into Google Classroom / Slack)
+          </button>
+        </>}
+      </div>
+
       <button onClick={() => { sfx.next(); onStart(); }} style={styles.bigButton}>BEGIN ▶</button>
       <button onClick={onLeaderboard} style={styles.teacherBtn}>🏆 Leaderboard</button>
       <button onClick={onTeacher} style={styles.teacherBtn}>👨‍🏫 Teacher Dashboard</button>
+      {toast && <div style={styles.toast}>{toast}</div>}
     </div>
   );
 }
 
 // ===== MAIN GAME =====
-function Game({ avatar, onEnd, settings, setSettings }) {
+function Game({ avatar, seed, onEnd, settings, setSettings }) {
   const av = avatar || defaultAvatar();
   const totalTurns = (GAME_LENGTHS[settings.gameLength] || GAME_LENGTHS.standard).turns;
   const dt = HORIZON_YEARS / totalTurns;
   const baseIncomePerTurn = START.incomePerYear * dt;
+  // Single Game-scoped seeded RNG. Every gameplay random draw flows through
+  // this — events, asset shocks in MC, Chad/Leo triggers, insider tips, the
+  // schedule. Same seed → identical 10 years for every player in a class.
+  const rngRef = useRef(null);
+  if (rngRef.current === null) rngRef.current = makeRng(seed || 'WSH-UNSEEDED');
+  const rng = rngRef.current;
   const [turn, setTurn] = useState(1);
   const [cash, setCash] = useState(START.cash);
   const [loan, setLoan] = useState(START.loan);
@@ -811,7 +912,7 @@ function Game({ avatar, onEnd, settings, setSettings }) {
   const [screenShake, setScreenShake] = useState(0);
   const [priceFlash, setPriceFlash] = useState({});
   const [gameOver, setGameOver] = useState(false);
-  const [schedule, setSchedule] = useState(() => createSchedule(totalTurns));
+  const [schedule, setSchedule] = useState(() => createSchedule(totalTurns, rng));
   const [chadTip, setChadTip] = useState(null);
   const [chadMood, setChadMood] = useState('smug');
   const [chadHistory, setChadHistory] = useState([]); // {correct: bool}
@@ -826,6 +927,8 @@ function Game({ avatar, onEnd, settings, setSettings }) {
   const [milestone, setMilestone] = useState(null); // { tier } for celebration
   const [lifestyle, setLifestyle] = useState(getLifestyle(initialNW));
   const [musicMode, setMusicMode] = useState('normal');
+  const [toast, setToast] = useState('');
+  function flashToast(msg) { setToast(msg); setTimeout(() => setToast(''), 2000); }
 
   const portfolioValue = Object.entries(holdings).reduce((sum, [id, qty]) => sum + qty * prices[id], 0);
   const totalDebt = loan + creditCard;
@@ -894,8 +997,8 @@ function Game({ avatar, onEnd, settings, setSettings }) {
 
     // Damped, Poisson-style event. Most turns are uneventful so the calibrated
     // GBM trend (not an arbitrary shock stream) drives realized returns.
-    const event = Math.random() < eventProbPerTurn(dt)
-      ? EVENTS[Math.floor(Math.random() * EVENTS.length)]
+    const event = rng() < eventProbPerTurn(dt)
+      ? EVENTS[Math.floor(rng() * EVENTS.length)]
       : { text: '🟢 Quiet market — no major news.', shocks: {} };
     if (event.sfx) sfx[event.sfx]();
     if (event.sfx === 'crisis') { setScreenShake(8); setMusicMode('crisis'); setTimeout(() => setMusicMode('normal'), 3000); }
@@ -915,7 +1018,7 @@ function Game({ avatar, onEnd, settings, setSettings }) {
           if (a.id === 'TECH') shock += -s.direction * 0.02 * (s.surprise ? 2 : 1) * EVENT_SHOCK_SCALE;
         }
       });
-      const newP = stepPrice(prices[a.id], a.mu, a.sigma, shock, dt);
+      const newP = stepPrice(prices[a.id], a.mu, a.sigma, shock, dt, rng);
       newPrices[a.id] = newP;
       newHistory[a.id] = [...priceHistory[a.id], newP].slice(-40);
       const change = (newP - prices[a.id]) / prices[a.id];
@@ -932,7 +1035,7 @@ function Game({ avatar, onEnd, settings, setSettings }) {
       } else if (s.type === 'fed') {
         setEventLog(l => [{ turn: turn + 1, text: `🏦 Fed ${s.direction > 0 ? 'cut' : 'hike'}${s.surprise ? ' (SURPRISE!)' : ''}` }, ...l].slice(0, 8));
       } else if (s.type === 'ipo') {
-        const moon = Math.random() < 0.4;
+        const moon = rng() < 0.4;
         setEventLog(l => [{ turn: turn + 1, text: `🎯 NewCo IPO ${moon ? 'moons 🚀' : 'flops 💀'} (no shares available — kid, you needed a broker)` }, ...l].slice(0, 8));
       }
     });
@@ -990,8 +1093,8 @@ function Game({ avatar, onEnd, settings, setSettings }) {
     let updatedHoldings = { ...holdings };
 
     // Chad tip (every 8-12 turns)
-    if (!chadTip && !insiderTip && turn > 3 && turn % (8 + Math.floor(Math.random() * 5)) === 0) {
-      const tip = CHAD_TIPS[Math.floor(Math.random() * CHAD_TIPS.length)];
+    if (!chadTip && !insiderTip && turn > 3 && turn % (8 + Math.floor(rng() * 5)) === 0) {
+      const tip = CHAD_TIPS[Math.floor(rng() * CHAD_TIPS.length)];
       setChadTip({ ...tip, turn, resolved: false });
       setChadMood('smug');
       sfx.chad();
@@ -1012,13 +1115,13 @@ function Game({ avatar, onEnd, settings, setSettings }) {
 
     // Leo: lifestyle upgrade offer (Poisson-style, dt-scaled so the count is
     // stable across game lengths). Targeting ~3 offers per 10-yr game.
-    if (!leoOffer && !chadTip && !leoTip && !dilemma && turn > 4 && Math.random() < 0.35 * dt) {
-      setLeoOffer(pickRandom(LEO_LIFESTYLE_OFFERS));
+    if (!leoOffer && !chadTip && !leoTip && !dilemma && turn > 4 && rng() < 0.35 * dt) {
+      setLeoOffer(pickRandom(LEO_LIFESTYLE_OFFERS, rng));
       setLeoMood('hyped');
     }
     // Leo: peer-pressure pitch — rarer than Chad and offset from him.
-    if (!leoTip && !chadTip && !leoOffer && !insiderTip && turn > 6 && Math.random() < 0.25 * dt) {
-      const t = pickRandom(LEO_PEER_PITCHES);
+    if (!leoTip && !chadTip && !leoOffer && !insiderTip && turn > 6 && rng() < 0.25 * dt) {
+      const t = pickRandom(LEO_PEER_PITCHES, rng);
       setLeoTip({ ...t, turn, resolved: false });
       setLeoMood('hyped');
     }
@@ -1035,23 +1138,23 @@ function Game({ avatar, onEnd, settings, setSettings }) {
       setTimeout(() => setLeoTip(null), 4500);
     }
     // Filler flavor every so often — Leo is just... talking
-    if (!leoFlavor && !leoTip && !chadTip && Math.random() < 0.10 * dt) {
-      setLeoFlavor(pickRandom(LEO_FILLER));
+    if (!leoFlavor && !leoTip && !chadTip && rng() < 0.10 * dt) {
+      setLeoFlavor(pickRandom(LEO_FILLER, rng));
       setTimeout(() => setLeoFlavor(null), 3500);
     }
 
     // Insider tip
     let newTip = insiderTip;
-    if (!insiderTip && Math.random() < 0.06 && turn > 5) {
-      const tipAsset = ASSETS[Math.floor(Math.random() * (ASSETS.length - 1)) + 1];
-      newTip = { asset: tipAsset.id, direction: Math.random() < 0.6 ? 1 : -1, magnitude: 0.15 + Math.random() * 0.15, expiryTurn: turn + 3, revealed: false };
+    if (!insiderTip && rng() < 0.06 && turn > 5) {
+      const tipAsset = ASSETS[Math.floor(rng() * (ASSETS.length - 1)) + 1];
+      newTip = { asset: tipAsset.id, direction: rng() < 0.6 ? 1 : -1, magnitude: 0.15 + rng() * 0.15, expiryTurn: turn + 3, revealed: false };
     }
     if (insiderTip && turn >= insiderTip.expiryTurn) {
       const shock = insiderTip.direction * insiderTip.magnitude;
       newPrices[insiderTip.asset] *= (1 + shock);
       setEventLog(l => [{ turn: turn + 1, text: `📰 ${insiderTip.asset}: ${insiderTip.direction > 0 ? '+' : ''}${(shock*100).toFixed(0)}%` }, ...l].slice(0, 8));
       if (pendingInvestigation) {
-        const roll = Math.random();
+        const roll = rng();
         if (roll < 0.15) {
           setInJail(5); setFlags(f => ({ ...f, jailed: f.jailed + 1 }));
           newCash = Math.max(0, newCash - 1500);
@@ -1142,8 +1245,8 @@ function Game({ avatar, onEnd, settings, setSettings }) {
     if (creditCard > 0) setFlags(f => ({ ...f, leveredUp: f.leveredUp + 1 }));
     // Leo's group chat reacts to what you just bought (occasionally).
     const leoLines = LEO_GROUP_CHAT[assetId];
-    if (leoLines && Math.random() < 0.45) {
-      const quip = pickRandom(leoLines);
+    if (leoLines && rng() < 0.45) {
+      const quip = pickRandom(leoLines, rng);
       setEventLog(l => [{ turn, text: `💬 Leo: "${quip}"` }, ...l].slice(0, 8));
     }
     if (insiderTip && insiderTip.revealed && insiderTip.asset === assetId && insiderTip.direction > 0) {
@@ -1306,7 +1409,7 @@ function Game({ avatar, onEnd, settings, setSettings }) {
     if (flags.peerPressureBuys > 0) lessons.push('peer_pressure');
     if (!beatIndex) lessons.push('lost_to_index');
     if (creditCard > 0) lessons.push('cc_remaining');
-    const shareCode = `${av.handle}|${netWorth.toFixed(0)}|${indexValue.toFixed(0)}|${lessons.join(',')}`;
+    const shareCode = `${seed || 'NOSEED'}|${av.handle}|${netWorth.toFixed(0)}|${indexValue.toFixed(0)}|${lessons.join(',')}`;
     const chadCorrect = chadHistory.filter(h => h.correct).length;
     const leoCorrect = leoHistory.filter(h => h.correct).length;
     // Honest counterfactual: dollars spent on Leo's status purchases, compounded
@@ -1409,9 +1512,17 @@ function Game({ avatar, onEnd, settings, setSettings }) {
           <div style={styles.recapCard}>
             <div style={styles.recapTitle}>🎓 CODE FOR TEACHER</div>
             <div style={styles.codeBox}>{shareCode}</div>
+            <button onClick={async () => {
+                const ok = await copyToClipboard(shareCode);
+                flashToast(ok ? '📋 Code copied — paste it where your teacher asked.' : '⚠️ Copy failed — read it to your teacher.');
+              }}
+              style={{ ...styles.maxBtn, width: '100%', marginTop: '6px', borderColor: '#39ff14', color: '#39ff14' }}>
+              📋 Copy share code
+            </button>
           </div>
 
           <button onClick={onEnd} style={styles.bigButton}>PLAY AGAIN</button>
+          {toast && <div style={styles.toast}>{toast}</div>}
         </div>
       </div>
     );
@@ -1475,6 +1586,8 @@ function Game({ avatar, onEnd, settings, setSettings }) {
           <span style={styles.dayCounter}>T {turn}/{totalTurns}</span>
         </div>
       </div>
+
+      {seed && <div style={styles.seedBar} title="Same seed = same 10-year market for everyone in your class.">🎓 Class seed: <b>{seed}</b></div>}
 
       {inJail > 0 && <div style={styles.jail}>🚔 IN JAIL — {inJail} turns</div>}
       {winStreak >= 3 && <div style={styles.streak}>🔥 {winStreak}-turn streak!</div>}
@@ -1750,13 +1863,31 @@ function NetWorthChart({ netWorthHistory, indexHistory, indexValue, netWorth }) 
 export default function App() {
   const [screen, setScreen] = useState('start');
   const [avatar, setAvatar] = useState(() => loadProfile().avatar || defaultAvatar());
-  const [settings, setSettings] = useState({ music: true, gameLength: 'standard', autoSpeed: 'off' });
+  const [settings, setSettings] = useState(() => {
+    // Pre-fill classSeed from the URL when the link includes ?seed=WSH-XXXXXX.
+    // Lets a teacher share one link instead of dictating a code to 30 kids.
+    let seedFromUrl = '';
+    if (typeof window !== 'undefined' && window.location && window.location.search) {
+      const code = normalizeSeedCode(new URLSearchParams(window.location.search).get('seed') || '');
+      if (/^WSH-[A-Z0-9]{6}$/.test(code)) seedFromUrl = code;
+    }
+    return { music: true, gameLength: 'standard', autoSpeed: 'off', classSeed: seedFromUrl };
+  });
+  const [activeSeed, setActiveSeed] = useState(null); // seed used by the current/last game
   useEffect(() => { musicEnabled = settings.music; }, [settings.music]);
+  function startGame() {
+    // Class seed (if the teacher distributed one) → identical 10 years for
+    // every student who enters it. Otherwise a fresh random seed per run.
+    const code = normalizeSeedCode(settings.classSeed);
+    const seed = code || generateSeedCode();
+    setActiveSeed(seed);
+    setScreen('game');
+  }
   if (screen === 'teacher') return <TeacherDashboard onClose={() => setScreen('start')} />;
   if (screen === 'leaderboard') return <Leaderboard onClose={() => setScreen('start')} />;
-  if (screen === 'game') return <Game avatar={avatar} onEnd={() => setScreen('start')} settings={settings} setSettings={setSettings} />;
+  if (screen === 'game') return <Game avatar={avatar} seed={activeSeed} onEnd={() => setScreen('start')} settings={settings} setSettings={setSettings} />;
   return <StartScreen
-    onStart={() => setScreen('game')}
+    onStart={startGame}
     avatar={avatar}
     setAvatar={(a) => { setAvatar(a); saveAvatar(a); }}
     onTeacher={() => setScreen('teacher')}
@@ -1802,6 +1933,8 @@ const styles = {
   upcomingTurn: { color: '#d4a017', marginRight: '6px', fontWeight: 'bold' },
   mentorBox: { background: 'linear-gradient(135deg, #1a1408, #0a0a0a)', border: '1px solid #8b6914', padding: '10px', borderRadius: '4px', marginBottom: '12px', display: 'flex', gap: '10px' },
   onboardBanner: { background: 'linear-gradient(135deg, #08182a, #0a0a0a)', border: '1px solid #39a0ff', padding: '10px', borderRadius: '4px', marginBottom: '10px' },
+  seedBar: { fontSize: '10px', color: '#39a0ff', textAlign: 'center', padding: '4px 8px', background: '#0a0a14', border: '1px solid #1a2a3a', borderRadius: '4px', marginBottom: '10px', letterSpacing: '1px' },
+  toast: { position: 'fixed', bottom: '20px', left: '50%', transform: 'translateX(-50%)', background: '#0f1f0f', border: '1px solid #39ff14', color: '#39ff14', padding: '10px 16px', borderRadius: '6px', fontSize: '12px', boxShadow: '0 0 20px rgba(57,255,20,0.3)', zIndex: 200, fontFamily: 'inherit' },
   onboardTitle: { fontSize: '10px', color: '#39a0ff', letterSpacing: '2px', marginBottom: '6px' },
   onboardBody: { fontSize: '11px', lineHeight: '1.5', color: '#d0e6ff' },
   mentorAvatar: { fontSize: '32px' },

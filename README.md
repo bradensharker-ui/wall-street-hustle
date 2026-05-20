@@ -1,5 +1,9 @@
 # Wall Street Hustle
 
+[![CI](https://github.com/bradensharker-ui/wall-street-hustle/actions/workflows/ci.yml/badge.svg)](https://github.com/bradensharker-ui/wall-street-hustle/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![Content: CC BY 4.0](https://img.shields.io/badge/Content-CC%20BY%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by/4.0/)
+
 A classroom-scale financial-literacy game. Students build an avatar, get one
 realistic starting situation (cash, a student loan, a paycheck), and play
 ten in-game years of investing decisions. The lessons — vol drag, debt math,
@@ -74,14 +78,27 @@ A "seeded shared market" — every student plays the *identical* 10 years
 from one teacher-provided seed — is the Milestone 2 feature. Until then,
 the Teacher Dashboard aggregates student codes by hand-typed handle.
 
+## Deployment
+
+The repo is configured for one-click Netlify deploys via [`netlify.toml`](./netlify.toml).
+
+To go live:
+
+1. Sign in at [app.netlify.com](https://app.netlify.com) (free tier is fine).
+2. **Add new site → Import an existing project → GitHub** → pick this repo.
+3. Netlify reads `netlify.toml`, runs `npm run build`, publishes `dist/`.
+
+Future pushes to `main` redeploy automatically. Every push also runs CI on
+GitHub Actions (`.github/workflows/ci.yml`) — tests + build must pass.
+
 ## Status
 
 | Milestone | Scope | Status |
 |----------:|-------|--------|
 | **1** | Defensibility foundation (tests, calibration doc, license) | ✅ done |
-| **2** | Seeded classroom (deterministic RNG, teacher seed, 30-player optionality) | in progress |
+| **2** | Seeded classroom (deterministic RNG, teacher seed, 30-player optionality) | ✅ done |
 | **3** | Accessibility pass + teacher's guide PDF | next |
-| **4** | Production hosting + deployment | next |
+| **4** | Production hosting + deployment | repo ready, awaiting Netlify connect |
 
 ## License
 

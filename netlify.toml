@@ -1,0 +1,24 @@
+# Netlify deployment config. Connect this repo in the Netlify dashboard and
+# every push to `main` builds & publishes automatically.
+
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+# SPA fallback — every unknown route should serve index.html so the React app
+# can handle its own routing. (Currently the app uses screen state, no routes,
+# but this keeps future links/refreshes from breaking.)
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# Sane security headers — this app collects no PII and makes no network calls,
+# but defense in depth costs nothing.
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Permissions-Policy = "camera=(), microphone=(), geolocation=()"
