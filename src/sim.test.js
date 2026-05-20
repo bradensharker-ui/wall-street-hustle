@@ -210,6 +210,20 @@ describe('makeRng / hashSeed (classroom determinism)', () => {
       expect(v).toBeLessThan(1);
     }
   });
+
+  test('getState/setState round-trip preserves the full sequence (refresh-safe)', () => {
+    // Two RNGs from the same seed. We advance r1 by 7 draws, snapshot its
+    // state, then "refresh" by creating a fresh RNG and restoring the state.
+    // Subsequent draws must match what the original would have produced.
+    const r1 = makeRng('WSH-CLASS01');
+    for (let i = 0; i < 7; i++) r1();
+    const snapshot = r1.getState();
+    const r2 = makeRng('WSH-CLASS01');
+    r2.setState(snapshot);
+    for (let i = 0; i < 50; i++) {
+      expect(r2()).toBe(r1());
+    }
+  });
 });
 
 describe('Seed-code formatting', () => {

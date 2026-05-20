@@ -861,71 +861,98 @@ function Game({ avatar, seed, onEnd, settings, setSettings }) {
   const totalTurns = (GAME_LENGTHS[settings.gameLength] || GAME_LENGTHS.standard).turns;
   const dt = HORIZON_YEARS / totalTurns;
   const baseIncomePerTurn = START.incomePerYear * dt;
+  // Autosave restore. If localStorage holds an in-progress save that matches
+  // this seed and game length, we restore it; otherwise start fresh. The
+  // restore happens exactly once at mount via the ref-cache pattern.
+  const SAVE_KEY = `wsh_savegame_v1_${seed || 'solo'}`;
+  const savedRef = useRef(null);
+  if (savedRef.current === null) {
+    try {
+      const raw = (typeof localStorage !== 'undefined') ? localStorage.getItem(SAVE_KEY) : null;
+      if (raw) {
+        const s = JSON.parse(raw);
+        if (s && s.v === 1 && !s.gameOver && s.totalTurns === totalTurns) {
+          savedRef.current = s;
+        }
+      }
+    } catch (e) { /* ignore */ }
+    if (savedRef.current === null) savedRef.current = {};
+  }
+  const saved = savedRef.current;
   // Single Game-scoped seeded RNG. Every gameplay random draw flows through
   // this — events, asset shocks in MC, Chad/Leo triggers, insider tips, the
   // schedule. Same seed → identical 10 years for every player in a class.
+  // On restore, we replay the RNG state so post-refresh draws are byte-
+  // identical to what would have happened without the refresh.
   const rngRef = useRef(null);
-  if (rngRef.current === null) rngRef.current = makeRng(seed || 'WSH-UNSEEDED');
+  if (rngRef.current === null) {
+    rngRef.current = makeRng(seed || 'WSH-UNSEEDED');
+    if (typeof saved.rngState === 'number') rngRef.current.setState(saved.rngState);
+  }
   const rng = rngRef.current;
-  const [turn, setTurn] = useState(1);
-  const [cash, setCash] = useState(START.cash);
-  const [loan, setLoan] = useState(START.loan);
-  const [creditCard, setCreditCard] = useState(START.cc);
-  const [holdings, setHoldings] = useState({});
-  const [prices, setPrices] = useState(Object.fromEntries(ASSETS.map(a => [a.id, 100])));
-  const [priceHistory, setPriceHistory] = useState(Object.fromEntries(ASSETS.map(a => [a.id, [100]])));
+  // Helper: pick saved value if present, else default. Using `in` lets us
+  // preserve falsy values (0, false, null, '') that hasOwnProperty would too
+  // but `in` is concise and reads cleanly.
+  const sv = (key, def) => (key in saved ? saved[key] : def);
+  const [turn, setTurn] = useState(() => sv('turn', 1));
+  const [cash, setCash] = useState(() => sv('cash', START.cash));
+  const [loan, setLoan] = useState(() => sv('loan', START.loan));
+  const [creditCard, setCreditCard] = useState(() => sv('creditCard', START.cc));
+  const [holdings, setHoldings] = useState(() => sv('holdings', {}));
+  const [prices, setPrices] = useState(() => sv('prices', Object.fromEntries(ASSETS.map(a => [a.id, 100]))));
+  const [priceHistory, setPriceHistory] = useState(() => sv('priceHistory', Object.fromEntries(ASSETS.map(a => [a.id, [100]]))));
   const initialNW = START.cash - START.loan - START.cc;
-  const [netWorthHistory, setNetWorthHistory] = useState([initialNW]);
-  const [indexHistory, setIndexHistory] = useState([initialNW]);
+  const [netWorthHistory, setNetWorthHistory] = useState(() => sv('netWorthHistory', [initialNW]));
+  const [indexHistory, setIndexHistory] = useState(() => sv('indexHistory', [initialNW]));
   // Benchmark = a passive "responsible twin": same start cash invested 60/40,
   // same starting debt at same rates, same paycheck — uses income to pay down
   // debt (CC first) before investing the rest. This makes "beat the index" a
   // fair comparison instead of one inflated by the player's exogenous income.
-  const [idxInvested, setIdxInvested] = useState(START.cash);
-  const [idxLoan, setIdxLoan] = useState(START.loan);
-  const [idxCC, setIdxCC] = useState(START.cc);
+  const [idxInvested, setIdxInvested] = useState(() => sv('idxInvested', START.cash));
+  const [idxLoan, setIdxLoan] = useState(() => sv('idxLoan', START.loan));
+  const [idxCC, setIdxCC] = useState(() => sv('idxCC', START.cc));
   // Per-asset buy-and-hold counterfactual: same paycheck/debt cash flows as the
   // benchmark twin, but the investable remainder goes 100% into one asset.
   // Powers the end-of-run "best single asset in hindsight" comparison.
-  const [cfInvested, setCfInvested] = useState(Object.fromEntries(ASSETS.map(a => [a.id, START.cash])));
+  const [cfInvested, setCfInvested] = useState(() => sv('cfInvested', Object.fromEntries(ASSETS.map(a => [a.id, START.cash]))));
   // Emergent-lesson state: employer match opted-in, a pending decision dilemma,
   // and behavior counts detected from the player's OWN trades (not forced).
-  const [matchOn, setMatchOn] = useState(false);
-  const [raiseMultiplier, setRaiseMultiplier] = useState(1);
-  const [marginUnlocked, setMarginUnlocked] = useState(false);
-  const [ccLimitState, setCcLimitState] = useState(START.ccLimit);
-  const [dilemma, setDilemma] = useState(null);
-  const [dilemmaSeen, setDilemmaSeen] = useState({});
+  const [matchOn, setMatchOn] = useState(() => sv('matchOn', false));
+  const [raiseMultiplier, setRaiseMultiplier] = useState(() => sv('raiseMultiplier', 1));
+  const [marginUnlocked, setMarginUnlocked] = useState(() => sv('marginUnlocked', false));
+  const [ccLimitState, setCcLimitState] = useState(() => sv('ccLimitState', START.ccLimit));
+  const [dilemma, setDilemma] = useState(() => sv('dilemma', null));
+  const [dilemmaSeen, setDilemmaSeen] = useState(() => sv('dilemmaSeen', {}));
   const incomePerTurn = baseIncomePerTurn * (matchOn ? 1.5 : 1) * raiseMultiplier;
-  const [eventLog, setEventLog] = useState([{ turn: 0, text: `📰 ${av.face} ${av.name} starts with $${START.cash} and a $${START.loan} student loan.` }]);
-  const [mentorMsg, setMentorMsg] = useState(MENTOR_LINES.start);
-  const [insiderTip, setInsiderTip] = useState(null);
-  const [pendingInvestigation, setPendingInvestigation] = useState(null);
-  const [inJail, setInJail] = useState(0);
-  const [winStreak, setWinStreak] = useState(0);
-  const [holdStreak, setHoldStreak] = useState(Object.fromEntries(ASSETS.map(a => [a.id, 0])));
-  const [achievements, setAchievements] = useState([]);
-  const [flags, setFlags] = useState({ chasedMeme: 0, insiderRevealed: 0, insiderTraded: 0, jailed: 0, ccBorrows: 0, panicSells: 0, fomoBuys: 0, chadFollowed: 0, chadIgnored: 0, emergencyToCC: 0, declinedMatch: 0, leveredUp: 0, lifestyleBuys: 0, peerPressureBuys: 0, leoIgnored: 0, raiseAccepted: 0, marginUsed: 0 });
-  const [selectedAsset, setSelectedAsset] = useState('SPX');
+  const [eventLog, setEventLog] = useState(() => sv('eventLog', [{ turn: 0, text: `📰 ${av.face} ${av.name} starts with $${START.cash} and a $${START.loan} student loan.` }]));
+  const [mentorMsg, setMentorMsg] = useState(() => sv('mentorMsg', MENTOR_LINES.start));
+  const [insiderTip, setInsiderTip] = useState(() => sv('insiderTip', null));
+  const [pendingInvestigation, setPendingInvestigation] = useState(() => sv('pendingInvestigation', null));
+  const [inJail, setInJail] = useState(() => sv('inJail', 0));
+  const [winStreak, setWinStreak] = useState(() => sv('winStreak', 0));
+  const [holdStreak, setHoldStreak] = useState(() => sv('holdStreak', Object.fromEntries(ASSETS.map(a => [a.id, 0]))));
+  const [achievements, setAchievements] = useState(() => sv('achievements', []));
+  const [flags, setFlags] = useState(() => sv('flags', { chasedMeme: 0, insiderRevealed: 0, insiderTraded: 0, jailed: 0, ccBorrows: 0, panicSells: 0, fomoBuys: 0, chadFollowed: 0, chadIgnored: 0, emergencyToCC: 0, declinedMatch: 0, leveredUp: 0, lifestyleBuys: 0, peerPressureBuys: 0, leoIgnored: 0, raiseAccepted: 0, marginUsed: 0 }));
+  const [selectedAsset, setSelectedAsset] = useState(() => sv('selectedAsset', 'SPX'));
   const [tradeAmount, setTradeAmount] = useState(1);
   const [showInfo, setShowInfo] = useState(null);
   const [screenShake, setScreenShake] = useState(0);
   const [priceFlash, setPriceFlash] = useState({});
-  const [gameOver, setGameOver] = useState(false);
-  const [schedule, setSchedule] = useState(() => createSchedule(totalTurns, rng));
-  const [chadTip, setChadTip] = useState(null);
-  const [chadMood, setChadMood] = useState('smug');
-  const [chadHistory, setChadHistory] = useState([]); // {correct: bool}
+  const [gameOver, setGameOver] = useState(() => sv('gameOver', false));
+  const [schedule, setSchedule] = useState(() => sv('schedule', null) || createSchedule(totalTurns, rng));
+  const [chadTip, setChadTip] = useState(() => sv('chadTip', null));
+  const [chadMood, setChadMood] = useState(() => sv('chadMood', 'smug'));
+  const [chadHistory, setChadHistory] = useState(() => sv('chadHistory', [])); // {correct: bool}
   // Leo: the peer (vs. Chad the finfluencer). Separate state — Leo's offers
   // and his peer-pressure pitches don't crowd Chad out, they alternate.
-  const [leoOffer, setLeoOffer] = useState(null);   // {item,emoji,cost,pitch}
-  const [leoTip, setLeoTip] = useState(null);       // {asset,text,turn,resolved,correct}
-  const [leoMood, setLeoMood] = useState('cool');
-  const [leoHistory, setLeoHistory] = useState([]); // peer-pressure track record
-  const [leoFlavor, setLeoFlavor] = useState(null); // transient filler quip
-  const [lifestyleSpent, setLifestyleSpent] = useState(0);
-  const [milestone, setMilestone] = useState(null); // { tier } for celebration
-  const [lifestyle, setLifestyle] = useState(getLifestyle(initialNW));
+  const [leoOffer, setLeoOffer] = useState(() => sv('leoOffer', null));   // {item,emoji,cost,pitch}
+  const [leoTip, setLeoTip] = useState(() => sv('leoTip', null));       // {asset,text,turn,resolved,correct}
+  const [leoMood, setLeoMood] = useState(() => sv('leoMood', 'cool'));
+  const [leoHistory, setLeoHistory] = useState(() => sv('leoHistory', [])); // peer-pressure track record
+  const [leoFlavor, setLeoFlavor] = useState(null); // transient filler quip (not persisted)
+  const [lifestyleSpent, setLifestyleSpent] = useState(() => sv('lifestyleSpent', 0));
+  const [milestone, setMilestone] = useState(null); // { tier } for celebration (transient)
+  const [lifestyle, setLifestyle] = useState(() => sv('lifestyle', getLifestyle(initialNW)));
   const [musicMode, setMusicMode] = useState('normal');
   const [toast, setToast] = useState('');
   function flashToast(msg) { setToast(msg); setTimeout(() => setToast(''), 2000); }
@@ -976,6 +1003,41 @@ function Game({ avatar, seed, onEnd, settings, setSettings }) {
     savedRunRef.current = true;
     recordRun({ netWorth, beat: netWorth > indexValue });
   }, [gameOver]);
+
+  // Autosave: writes a full snapshot to localStorage on every turn change so
+  // a refresh (or accidental tab close) doesn't blow away the game. RNG state
+  // is snapshotted too — restore is byte-identical to a no-refresh continuation.
+  // Cleared on game-over so we don't restore a finished run on a fresh start.
+  useEffect(() => {
+    if (gameOver) {
+      try { localStorage.removeItem(SAVE_KEY); } catch (e) { /* ignore */ }
+      return;
+    }
+    try {
+      const snapshot = {
+        v: 1, totalTurns, seed: seed || null,
+        turn, cash, loan, creditCard, holdings, prices, priceHistory,
+        netWorthHistory, indexHistory,
+        idxInvested, idxLoan, idxCC, cfInvested,
+        matchOn, raiseMultiplier, marginUnlocked, ccLimitState,
+        dilemma, dilemmaSeen,
+        eventLog, mentorMsg,
+        insiderTip, pendingInvestigation,
+        inJail, winStreak, holdStreak,
+        achievements, flags,
+        selectedAsset, gameOver,
+        schedule,
+        chadTip, chadMood, chadHistory,
+        leoOffer, leoTip, leoMood, leoHistory, lifestyleSpent,
+        lifestyle,
+        rngState: rngRef.current.getState(),
+      };
+      localStorage.setItem(SAVE_KEY, JSON.stringify(snapshot));
+    } catch (e) { /* localStorage quota or serialization issue — best effort */ }
+    // Intentionally narrow deps: writing on every micro-state-change would be
+    // wasteful. Per-turn (and on gameOver flip) is the right granularity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [turn, gameOver]);
 
   function addAchievement(text) {
     if (achievements.includes(text)) return;
