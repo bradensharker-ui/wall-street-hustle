@@ -172,6 +172,57 @@ function buildShareUrl(seed) {
   return `${origin}${pathname}?seed=${seed}`;
 }
 
+// ===== SESSION API (synchronized classroom play) =====
+// Client wrappers for the Netlify Function backend. The session lives on the
+// server keyed by seed; the game logic stays in the browser. We post the
+// player's snapshot every few seconds so the teacher can see the whole class.
+
+const SESSION_BASE = '/api/session';
+
+async function sessionFetch(seed, init = {}) {
+  try {
+    const r = await fetch(`${SESSION_BASE}/${encodeURIComponent(seed)}`, {
+      ...init,
+      headers: { 'content-type': 'application/json', ...(init.headers || {}) },
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) return { ok: false, status: r.status, error: data?.error || r.statusText };
+    return data;
+  } catch (e) {
+    return { ok: false, status: 0, error: String(e?.message || e) };
+  }
+}
+
+const sessionApi = {
+  get:     (seed)                 => sessionFetch(seed, { method: 'GET' }),
+  create:  (seed, opts = {})      => sessionFetch(seed, { method: 'POST', body: JSON.stringify({ action: 'create', ...opts }) }),
+  start:   (seed, teacherToken)   => sessionFetch(seed, { method: 'POST', body: JSON.stringify({ action: 'start', teacherToken }) }),
+  end:     (seed, teacherToken)   => sessionFetch(seed, { method: 'POST', body: JSON.stringify({ action: 'end', teacherToken }) }),
+  pause:   (seed, teacherToken)   => sessionFetch(seed, { method: 'POST', body: JSON.stringify({ action: 'pause', teacherToken }) }),
+  resume:  (seed, teacherToken)   => sessionFetch(seed, { method: 'POST', body: JSON.stringify({ action: 'resume', teacherToken }) }),
+  join:    (seed, payload)        => sessionFetch(seed, { method: 'POST', body: JSON.stringify({ action: 'join', ...payload }) }),
+  update:  (seed, payload)        => sessionFetch(seed, { method: 'POST', body: JSON.stringify({ action: 'update', ...payload }) }),
+};
+
+// Teacher tokens live in localStorage keyed by seed so the teacher can resume
+// control after a refresh on the same device.
+const TEACHER_TOKEN_KEY = (seed) => `wsh_teacher_token_${seed}`;
+function saveTeacherToken(seed, token) { try { localStorage.setItem(TEACHER_TOKEN_KEY(seed), token); } catch (e) {} }
+function loadTeacherToken(seed) { try { return localStorage.getItem(TEACHER_TOKEN_KEY(seed)); } catch (e) { return null; } }
+
+// Current-turn math derived from the server-provided session timestamp.
+// Computed client-side so we don't need a per-turn server message; one POST
+// at session-start drives the whole class.
+function currentTurnFromSession(session) {
+  if (!session || !session.sessionStartedAt) return 0;
+  if (session.state === 'paused' && session.pausedAt) {
+    // Frozen at the elapsed-as-of-pause time
+    return Math.min(session.totalTurns, 1 + Math.floor((session.pausedAt - session.sessionStartedAt) / 1000 / session.turnDuration));
+  }
+  const elapsed = (Date.now() - session.sessionStartedAt) / 1000;
+  return Math.min(session.totalTurns, 1 + Math.floor(elapsed / session.turnDuration));
+}
+
 // Best-effort clipboard write. Modern Clipboard API on HTTPS/localhost; a
 // hidden <textarea> + execCommand fallback for older browsers / odd contexts.
 async function copyToClipboard(text) {
@@ -556,12 +607,165 @@ function MonteCarloPanel() {
   );
 }
 
+// ===== LIVE CLASS PANEL =====
+// Teacher control center for a synchronized session. Holds the teacherToken
+// in localStorage so refreshes don't lock the teacher out of their own class.
+function LiveClassPanel() {
+  const [seed, setSeed] = useState('');
+  const [session, setSession] = useState(null);
+  const [teacherToken, setTeacherToken] = useState('');
+  const [status, setStatus] = useState('');
+  const [turnDuration, setTurnDuration] = useState(15);
+  const [toast, setToast] = useState('');
+  function flash(msg) { setToast(msg); setTimeout(() => setToast(''), 2200); }
+
+  // Re-hydrate teacherToken from localStorage when seed changes.
+  useEffect(() => {
+    if (!seed) { setTeacherToken(''); return; }
+    setTeacherToken(loadTeacherToken(seed) || '');
+  }, [seed]);
+
+  // Poll the session every 2s while we have a seed.
+  useEffect(() => {
+    if (!seed) return;
+    let cancelled = false;
+    async function poll() {
+      const r = await sessionApi.get(seed);
+      if (cancelled) return;
+      if (r.ok && r.session) setSession(r.session);
+      else if (r.status === 404) setSession(null);
+    }
+    poll();
+    const id = setInterval(poll, 2000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [seed]);
+
+  async function doGenerate() {
+    const s = generateSeedCode();
+    setSeed(s);
+    setStatus('Generating session…');
+    const r = await sessionApi.create(s, { turnDuration, totalTurns: 100 });
+    if (r.ok && r.teacherToken) {
+      saveTeacherToken(s, r.teacherToken);
+      setTeacherToken(r.teacherToken);
+      setSession(r.session);
+      setStatus('');
+      flash('Session created. Share the class link below.');
+    } else {
+      setStatus(r.error || 'Could not create session');
+    }
+  }
+
+  async function doStart() {
+    if (!teacherToken) return flash('Missing teacher token (re-create the session on this device).');
+    const r = await sessionApi.start(seed, teacherToken);
+    if (r.ok) { setSession(r.session); flash('Class started — everyone advances together.'); }
+    else flash(r.error || 'Could not start');
+  }
+  async function doPause() {
+    const r = await sessionApi.pause(seed, teacherToken);
+    if (r.ok) { setSession(r.session); flash('Paused.'); } else flash(r.error || 'Could not pause');
+  }
+  async function doResume() {
+    const r = await sessionApi.resume(seed, teacherToken);
+    if (r.ok) { setSession(r.session); flash('Resumed.'); } else flash(r.error || 'Could not resume');
+  }
+  async function doEnd() {
+    if (!window.confirm('End the class for everyone?')) return;
+    const r = await sessionApi.end(seed, teacherToken);
+    if (r.ok) { setSession(r.session); flash('Class ended.'); } else flash(r.error || 'Could not end');
+  }
+
+  const players = session ? Object.values(session.players || {}) : [];
+  players.sort((a, b) => (b.netWorth || 0) - (a.netWorth || 0));
+  const elapsed = session?.sessionStartedAt ? (Date.now() - session.sessionStartedAt) / 1000 : 0;
+  const inTurn = session ? elapsed % session.turnDuration : 0;
+  const remain = session ? Math.max(0, Math.ceil(session.turnDuration - inTurn)) : 0;
+  const currentTurn = session ? currentTurnFromSession(session) : 0;
+
+  return (
+    <>
+      <div style={styles.dashCard}>
+        <div style={styles.cardTitle}>🎓 SESSION</div>
+        <div style={styles.tradeRow}>
+          <input value={seed} placeholder="WSH-XXXXXX"
+            onChange={e => setSeed(normalizeSeedCode(e.target.value))}
+            style={{ ...styles.input, marginBottom: 0 }} />
+          <button onClick={doGenerate} style={styles.maxBtn}>🎲 New class</button>
+        </div>
+        <div style={styles.tradeRow}>
+          <label style={{ fontSize: '11px', color: '#888', flex: 1 }}>
+            Turn length (sec):
+            <input type="number" min={5} max={180} value={turnDuration}
+              onChange={e => setTurnDuration(Math.max(5, Math.min(180, parseInt(e.target.value) || 15)))}
+              style={{ ...styles.input, marginBottom: 0, marginLeft: '6px', width: '60px', display: 'inline-block' }} />
+          </label>
+        </div>
+        {status && <div style={styles.muted}>{status}</div>}
+        {seed && session && (
+          <>
+            <div style={styles.statLine}>
+              State: <b style={{ color: session.state === 'playing' ? '#39ff14' : '#d4a017' }}>{session.state.toUpperCase()}</b>
+              {session.state === 'playing' && <> · turn <b>{currentTurn}/{session.totalTurns}</b> · next in <b>{remain}s</b></>}
+            </div>
+            <button onClick={async () => {
+                const ok = await copyToClipboard(buildShareUrl(seed));
+                flash(ok ? '🔗 Class link copied.' : '⚠️ Copy failed.');
+              }}
+              style={{ ...styles.maxBtn, width: '100%', marginTop: '6px', borderColor: '#39a0ff', color: '#39a0ff' }}>
+              🔗 Copy class link
+            </button>
+            {teacherToken ? (
+              <div style={styles.tradeRow}>
+                {session.state === 'lobby'   && <button onClick={doStart}  style={{ ...styles.submitBtn, flex: 1 }}>▶ Start class</button>}
+                {session.state === 'playing' && <button onClick={doPause}  style={{ ...styles.maxBtn, flex: 1, borderColor: '#d4a017', color: '#d4a017' }}>⏸ Pause</button>}
+                {session.state === 'paused'  && <button onClick={doResume} style={{ ...styles.submitBtn, flex: 1 }}>▶ Resume</button>}
+                {session.state !== 'ended'   && <button onClick={doEnd}    style={{ ...styles.maxBtn, flex: 1, borderColor: '#ff3b3b', color: '#ff3b3b' }}>🛑 End class</button>}
+              </div>
+            ) : (
+              <div style={styles.muted}>Read-only view — this device didn't create the session, so it can't control it.</div>
+            )}
+          </>
+        )}
+        {seed && !session && <div style={styles.muted}>No session found for that seed yet. Click "New class" to create one, or check the seed.</div>}
+      </div>
+
+      {session && (
+        <div style={styles.dashCard}>
+          <div style={styles.cardTitle}>👥 LIVE PLAYERS ({players.length})</div>
+          {players.length === 0 ? <div style={styles.muted}>Waiting for students to join with the class link…</div> :
+            players.map((p, i) => {
+              const stale = (Date.now() - (p.updatedAt || 0)) / 1000;
+              const isStale = stale > 12;
+              return (
+                <div key={p.handle} style={styles.resultRow}>
+                  <div>
+                    <b>{i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `#${i + 1}`} {p.name || p.handle}</b>
+                    <span style={{ color: '#666', fontSize: '10px' }}> @{p.handle}</span>
+                    {isStale && <span style={{ color: '#ff8855', fontSize: '10px', marginLeft: '6px' }}>· ⚠ {Math.round(stale)}s stale</span>}
+                  </div>
+                  <div style={{ fontSize: '11px', color: '#ddd' }}>
+                    T{p.turn || 0} · <b style={{ color: p.netWorth >= (p.indexValue || 0) ? '#39ff14' : '#ff3b3b' }}>${Math.round(p.netWorth || 0).toLocaleString()}</b>
+                    <span style={{ color: '#888' }}> / idx ${Math.round(p.indexValue || 0).toLocaleString()}</span>
+                    {p.gameOver && <span style={{ color: '#d4a017', marginLeft: '6px' }}>🏁</span>}
+                  </div>
+                </div>
+              );
+            })}
+        </div>
+      )}
+
+      {toast && <div style={styles.toast}>{toast}</div>}
+    </>
+  );
+}
+
 // ===== TEACHER DASHBOARD =====
 function TeacherDashboard({ onClose }) {
   const [results, setResults] = useState([]);
   const [studentName, setStudentName] = useState('');
   const [studentCode, setStudentCode] = useState('');
-  const [tab, setTab] = useState('class');
+  const [tab, setTab] = useState('live');
   const [selectedSeed, setSelectedSeed] = useState(''); // '' = all
 
   useEffect(() => {
@@ -617,10 +821,13 @@ function TeacherDashboard({ onClose }) {
         <button onClick={onClose} style={styles.maxBtn}>Exit</button>
       </div>
       <div style={styles.tabRow}>
+        <button onClick={() => setTab('live')} style={{ ...styles.tabBtn, background: tab === 'live' ? '#0f1f0f' : '#0a0a0a', borderColor: tab === 'live' ? '#39ff14' : '#333' }}>🔴 Live</button>
         <button onClick={() => setTab('class')} style={{ ...styles.tabBtn, background: tab === 'class' ? '#0f1f0f' : '#0a0a0a', borderColor: tab === 'class' ? '#39ff14' : '#333' }}>📋 Class</button>
         <button onClick={() => setTab('math')} style={{ ...styles.tabBtn, background: tab === 'math' ? '#0f1f0f' : '#0a0a0a', borderColor: tab === 'math' ? '#39ff14' : '#333' }}>🧪 Math</button>
         <button onClick={() => setTab('discuss')} style={{ ...styles.tabBtn, background: tab === 'discuss' ? '#0f1f0f' : '#0a0a0a', borderColor: tab === 'discuss' ? '#39ff14' : '#333' }}>💬 Prompts</button>
       </div>
+
+      {tab === 'live' && <LiveClassPanel />}
 
       {tab === 'class' && <>
         <div style={styles.dashCard}>
@@ -953,6 +1160,10 @@ function Game({ avatar, seed, onEnd, settings, setSettings }) {
   const [lifestyleSpent, setLifestyleSpent] = useState(() => sv('lifestyleSpent', 0));
   const [milestone, setMilestone] = useState(null); // { tier } for celebration (transient)
   const [lifestyle, setLifestyle] = useState(() => sv('lifestyle', getLifestyle(initialNW)));
+  // Synced-mode session state, declared up here so effects below can guard
+  // off `synced` without ordering hazards.
+  const [session, setSession] = useState(null);
+  const synced = !!(seed && session);
   const [musicMode, setMusicMode] = useState('normal');
   const [toast, setToast] = useState('');
   function flashToast(msg) { setToast(msg); setTimeout(() => setToast(''), 2000); }
@@ -989,12 +1200,14 @@ function Game({ avatar, seed, onEnd, settings, setSettings }) {
 
   // Auto-advance: re-armed every time `turn` changes, so each scheduled call
   // closes over fresh state instead of a stale setInterval snapshot.
+  // In synced classroom mode the server clock drives advancement; local auto
+  // is suppressed so it can't fight the server.
   useEffect(() => {
     const sp = AUTO_SPEEDS[settings.autoSpeed] || AUTO_SPEEDS.off;
-    if (sp.ms <= 0 || gameOver || dilemma) return;
+    if (sp.ms <= 0 || gameOver || dilemma || synced) return;
     const id = setTimeout(() => advanceTurn(), sp.ms);
     return () => clearTimeout(id);
-  }, [turn, gameOver, dilemma, settings.autoSpeed]);
+  }, [turn, gameOver, dilemma, settings.autoSpeed, synced]);
 
   // Record the run to the persistent profile exactly once when the game ends.
   const savedRunRef = useRef(false);
@@ -1037,6 +1250,97 @@ function Game({ avatar, seed, onEnd, settings, setSettings }) {
     // Intentionally narrow deps: writing on every micro-state-change would be
     // wasteful. Per-turn (and on gameOver flip) is the right granularity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [turn, gameOver]);
+
+  // =========================================================================
+  // SYNCHRONIZED CLASSROOM PLAY
+  // -------------------------------------------------------------------------
+  // When the seed has an active session on the server, the game runs in
+  // "synced mode": turn advancement is driven by a wall-clock anchor the
+  // teacher set, not by the local NEXT TURN button. Every student playing
+  // the same seed runs the same path (seedable RNG) and advances at the same
+  // moment (server timestamp). Each client posts its snapshot every 5 sec
+  // so the teacher's live view can see the whole class.
+  // (`session` and `synced` are declared earlier with the other state.)
+  // =========================================================================
+  const [, setTickClock] = useState(0); // forces re-render so countdown ticks
+
+  // Poll the session every 2.5s. Loss of connectivity → setSession(null)
+  // gracefully falls back to solo play.
+  useEffect(() => {
+    if (!seed) return;
+    let cancelled = false;
+    async function poll() {
+      const r = await sessionApi.get(seed);
+      if (cancelled) return;
+      if (r.ok && r.session) setSession(r.session);
+      else if (r.status === 404) setSession(null);
+    }
+    poll();
+    const id = setInterval(poll, 2500);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [seed]);
+
+  // Smooth clock pulse so the countdown UI ticks and the synced-advance
+  // effect re-evaluates against Date.now() without waiting for a poll.
+  useEffect(() => {
+    if (!synced || session.state !== 'playing') return;
+    const id = setInterval(() => setTickClock(t => (t + 1) & 0xffff), 500);
+    return () => clearInterval(id);
+  }, [synced, session?.state]);
+
+  // Server-clock-driven turn advancement. Recomputes each render; when the
+  // target turn moves past the local turn, advance one step per render until
+  // caught up. Dilemmas auto-dismiss on forced advance so the class moves
+  // together. (Trade-off: students who linger on a dilemma get the default.)
+  const targetTurn = synced && session.state === 'playing' ? currentTurnFromSession(session) : null;
+  useEffect(() => {
+    if (!synced || gameOver || targetTurn == null) return;
+    if (turn < targetTurn) {
+      if (dilemma) setDilemma(null);
+      advanceTurn();
+    }
+  // advanceTurn is intentionally not in deps — it's recreated each render
+  // and would re-trigger the effect forever; turn-change is the right signal.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetTurn, turn, gameOver, synced]);
+
+  // End detection — teacher ends the session → student sees game-over.
+  useEffect(() => {
+    if (synced && session?.state === 'ended' && !gameOver) setGameOver(true);
+  }, [synced, session?.state, gameOver]);
+
+  // Snapshot poster: always-fresh state via ref + 5-sec heartbeat. Plus an
+  // immediate post when turn or gameOver flips so the teacher sees progress
+  // without waiting on the heartbeat.
+  const liveStateRef = useRef({});
+  liveStateRef.current = { turn, netWorth, indexValue, gameOver };
+  useEffect(() => {
+    if (!synced || session?.state !== 'playing') return;
+    let cancelled = false;
+    function post() {
+      if (cancelled) return;
+      const s = liveStateRef.current;
+      sessionApi.update(seed, {
+        handle: av.handle, name: av.name,
+        turn: s.turn, netWorth: s.netWorth, indexValue: s.indexValue, gameOver: s.gameOver,
+      });
+    }
+    post();
+    const id = setInterval(post, 5000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [synced, session?.state, seed, av.handle, av.name]);
+
+  // Also post on every turn change so progress appears in the teacher view
+  // promptly, not just on the 5-sec heartbeat.
+  useEffect(() => {
+    if (!synced || session?.state !== 'playing') return;
+    const s = liveStateRef.current;
+    sessionApi.update(seed, {
+      handle: av.handle, name: av.name,
+      turn: s.turn, netWorth: s.netWorth, indexValue: s.indexValue, gameOver: s.gameOver,
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [turn, gameOver]);
 
   function addAchievement(text) {
@@ -1651,6 +1955,21 @@ function Game({ avatar, seed, onEnd, settings, setSettings }) {
 
       {seed && <div style={styles.seedBar} title="Same seed = same 10-year market for everyone in your class.">🎓 Class seed: <b>{seed}</b></div>}
 
+      {/* Synced-mode status bar — teacher-controlled session, server clock. */}
+      {synced && (
+        <div style={styles.syncedBar}>
+          {session.state === 'lobby' && <>🟡 <b>Waiting for teacher to start the class…</b></>}
+          {session.state === 'playing' && (() => {
+            const elapsed = (Date.now() - session.sessionStartedAt) / 1000;
+            const inTurn = elapsed % session.turnDuration;
+            const remain = Math.max(0, Math.ceil(session.turnDuration - inTurn));
+            return <>🔴 <b>LIVE</b> · turn {targetTurn ?? turn}/{session.totalTurns} · next in {remain}s · {Object.keys(session.players || {}).length} player(s)</>;
+          })()}
+          {session.state === 'paused' && <>⏸️ <b>Paused by teacher</b></>}
+          {session.state === 'ended' && <>🏁 <b>Class ended by teacher</b></>}
+        </div>
+      )}
+
       {inJail > 0 && <div style={styles.jail}>🚔 IN JAIL — {inJail} turns</div>}
       {winStreak >= 3 && <div style={styles.streak}>🔥 {winStreak}-turn streak!</div>}
 
@@ -1893,8 +2212,17 @@ function Game({ avatar, seed, onEnd, settings, setSettings }) {
         ))}
       </div>
 
-      <button onClick={advanceTurn} style={styles.bigButton}>
-        {(AUTO_SPEEDS[settings.autoSpeed] || AUTO_SPEEDS.off).ms > 0 ? '⏩ AUTO — tap for next now' : `⏭️ NEXT TURN (+$${incomePerTurn.toFixed(0)})`}
+      <button
+        onClick={synced ? undefined : advanceTurn}
+        disabled={synced}
+        style={{ ...styles.bigButton, opacity: synced ? 0.55 : 1, cursor: synced ? 'not-allowed' : 'pointer' }}>
+        {synced
+          ? (session.state === 'lobby' ? '⏳ WAITING FOR TEACHER' :
+             session.state === 'paused' ? '⏸️ PAUSED' :
+             session.state === 'ended'  ? '🏁 CLASS ENDED' :
+             '⏱ MOVING WITH CLASS')
+          : ((AUTO_SPEEDS[settings.autoSpeed] || AUTO_SPEEDS.off).ms > 0 ? '⏩ AUTO — tap for next now' : `⏭️ NEXT TURN (+$${incomePerTurn.toFixed(0)})`)
+        }
       </button>
     </div>
   );
@@ -1996,6 +2324,7 @@ const styles = {
   mentorBox: { background: 'linear-gradient(135deg, #1a1408, #0a0a0a)', border: '1px solid #8b6914', padding: '10px', borderRadius: '4px', marginBottom: '12px', display: 'flex', gap: '10px' },
   onboardBanner: { background: 'linear-gradient(135deg, #08182a, #0a0a0a)', border: '1px solid #39a0ff', padding: '10px', borderRadius: '4px', marginBottom: '10px' },
   seedBar: { fontSize: '10px', color: '#39a0ff', textAlign: 'center', padding: '4px 8px', background: '#0a0a14', border: '1px solid #1a2a3a', borderRadius: '4px', marginBottom: '10px', letterSpacing: '1px' },
+  syncedBar: { fontSize: '11px', color: '#ffaa00', textAlign: 'center', padding: '6px 10px', background: 'linear-gradient(135deg, #2a1a08, #0a0a0a)', border: '1px solid #d4a017', borderRadius: '4px', marginBottom: '10px', letterSpacing: '1px' },
   toast: { position: 'fixed', bottom: '20px', left: '50%', transform: 'translateX(-50%)', background: '#0f1f0f', border: '1px solid #39ff14', color: '#39ff14', padding: '10px 16px', borderRadius: '6px', fontSize: '12px', boxShadow: '0 0 20px rgba(57,255,20,0.3)', zIndex: 200, fontFamily: 'inherit' },
   onboardTitle: { fontSize: '10px', color: '#39a0ff', letterSpacing: '2px', marginBottom: '6px' },
   onboardBody: { fontSize: '11px', lineHeight: '1.5', color: '#d0e6ff' },

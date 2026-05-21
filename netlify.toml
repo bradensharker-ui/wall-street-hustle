@@ -5,9 +5,21 @@
   command = "npm run build"
   publish = "dist"
 
-# SPA fallback — every unknown route should serve index.html so the React app
-# can handle its own routing. (Currently the app uses screen state, no routes,
-# but this keeps future links/refreshes from breaking.)
+[functions]
+  # Bundle ES modules so we can import @netlify/blobs from session.js.
+  node_bundler = "esbuild"
+
+# Session API — friendly URL routed to the Netlify Function. The function's
+# `config.path` also lists this so direct invocations of /api/session/:seed
+# reach it regardless of redirect ordering.
+[[redirects]]
+  from = "/api/session/*"
+  to = "/.netlify/functions/session/:splat"
+  status = 200
+  force = true
+
+# SPA fallback — every other unknown route serves index.html so the React app
+# can handle its own routing. Must come AFTER the /api/* rule above.
 [[redirects]]
   from = "/*"
   to = "/index.html"
